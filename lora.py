@@ -96,6 +96,7 @@ class LoRAInjector:
         def _walk(mod: nn.Module):
             for n, child in list(mod.named_children()):
                 if isinstance(child, nn.Linear) and n in target_names:
+                    print("insert")
                     self._replace(mod, n, child)
                 else:
                     _walk(child)
