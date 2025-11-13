@@ -4,6 +4,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast, get_linear_schedule_with_warmup
 from datasets import load_dataset
+from lora import LoRAInjector
 
 class TrainerWithStats:
     def __init__(self, model, tokenizer, train_dataset, cfg):
