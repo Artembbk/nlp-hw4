@@ -1,86 +1,62 @@
-import math
+import time
 import torch
-from torch.optim import AdamW
+import torch.nn as nn
 from torch.utils.data import DataLoader
-from lora import LoRAInjector
+from transformers import GPT2LMHeadModel, GPT2TokenizerFast, get_linear_schedule_with_warmup
+from datasets import load_dataset
 
-class LoRATrainer:
-    """
-    • Встраивает LoRA в модель
-    • Считает trainable / total параметры
-    • Запускает цикл обучения (FW+BW)
-    • Возвращает лосс / perplexity
-    """
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        tokenizer,
-        dataset,            # HuggingFace Dataset, уже с полями input_ids, attention_mask
-        device: str = "cuda",
-        lora_cfg: dict = None,
-        train_cfg: dict = None
-    ):
-        self.device    = device
+class TrainerWithStats:
+    def __init__(self, model, tokenizer, train_dataset, cfg):
+        self.model = model
         self.tokenizer = tokenizer
-        self.dataset   = dataset
+        self.dataloader = DataLoader(train_dataset, batch_size=cfg['batch_size'], shuffle=True)
+        self.opt = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()),
+                                      lr=cfg['lr'])
+        total_steps = len(self.dataloader) * cfg['epochs']
+        self.scheduler = get_linear_schedule_with_warmup(self.opt, 
+                                                         num_warmup_steps=cfg['warmup_steps'],
+                                                         num_training_steps=total_steps)
+        self.device = cfg.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
+        self.model.to(self.device)
 
-        # LoRA-инъекция
-        
-        injector = LoRAInjector(model, **(lora_cfg or {}))
-        injector.add_lora()
-        self.model = injector.model.to(device)
-
-        # оптимизируем только LoRA-параметры
-        self.optimizer = AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            **(train_cfg.get("optim", {}) if train_cfg else {})
-        )
-
-        # DataLoader
-        bs = train_cfg.get("batch_size", 8) if train_cfg else 8
-        self.dl = DataLoader(
-            dataset,
-            batch_size=bs,
-            shuffle=True,
-            collate_fn=self._hf_collate
-        )
-
-        # Гиперы обучения
-        self.epochs    = train_cfg.get("epochs", 3) if train_cfg else 3
-        self.max_len   = train_cfg.get("max_length", 128) if train_cfg else 128
-
-
-
-    @staticmethod
-    def _hf_collate(batch_list):
-        from torch.utils.data import default_collate
-        keys = batch_list[0].keys()
-        return {k: default_collate([d[k] for d in batch_list]) for k in keys}
-
-    def count_parameters(self) -> dict:
+    def count_params(self):
         total = sum(p.numel() for p in self.model.parameters())
-        train = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        return {"total": total, "trainable": train}
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        return total, trainable
 
-    def train(self):
-        """Запускает обучение; возвращает список (loss, ppl) по эпохам."""
-        self.model.train()
-        results = []
-        for epoch in range(1, self.epochs + 1):
-            total_loss = 0.0
-            for batch in self.dl:
-                batch = {k: v.to(self.device) for k, v in batch.items()}
-                labels = batch["input_ids"]
-                out = self.model(**batch, labels=labels)
-                loss = out.loss
+    def measure_memory(self):
+        if self.device.startswith('cuda'):
+            return torch.cuda.max_memory_allocated(self.device) / 1024**2  # MB
+        return None
 
+    def train(self, epochs):
+        stats = {'step': [], 'loss': [], 
+                 'forward_time': [], 'backward_time': [], 'mem_MB': []}
+        step = 0
+        for epoch in range(epochs):
+            for batch in self.dataloader:
+                # Подготовка
+                inputs = self.tokenizer(batch['text'], return_tensors='pt',
+                                        padding=True, truncation=True).to(self.device)
+                # Forward
+                torch.cuda.reset_peak_memory_stats(self.device)
+                t0 = time.perf_counter()
+                outputs = self.model(**inputs, labels=inputs['input_ids'])
+                loss = outputs.loss
+                t1 = time.perf_counter()
+                # Backward
+                self.opt.zero_grad()
                 loss.backward()
-                self.optimizer.step(); self.optimizer.zero_grad()
+                t2 = time.perf_counter()
+                self.opt.step()
+                self.scheduler.step()
 
-                total_loss += loss.item()
+                # Сбор статистики
+                stats['step'].append(step)
+                stats['loss'].append(loss.item())
+                stats['forward_time'].append(t1 - t0)
+                stats['backward_time'].append(t2 - t1)
+                stats['mem_MB'].append(self.measure_memory())
+                step += 1
 
-            avg_loss = total_loss / len(self.dl)
-            ppl = math.exp(avg_loss)
-            results.append((avg_loss, ppl))
-            print(f"Epoch {epoch}: loss={avg_loss:.4f}, ppl={ppl:.2f}")
-        return results
+        return stats
