@@ -38,11 +38,24 @@ class LoRATrainer:
 
         # DataLoader
         bs = train_cfg.get("batch_size", 8) if train_cfg else 8
-        self.dl = DataLoader(dataset, batch_size=bs, shuffle=True)
+        self.dl = DataLoader(
+            dataset,
+            batch_size=bs,
+            shuffle=True,
+            collate_fn=self._hf_collate
+        )
 
         # Гиперы обучения
         self.epochs    = train_cfg.get("epochs", 3) if train_cfg else 3
         self.max_len   = train_cfg.get("max_length", 128) if train_cfg else 128
+
+
+
+    @staticmethod
+    def _hf_collate(batch_list):
+        from torch.utils.data import default_collate
+        keys = batch_list[0].keys()
+        return {k: default_collate([d[k] for d in batch_list]) for k in keys}
 
     def count_parameters(self) -> dict:
         total = sum(p.numel() for p in self.model.parameters())
