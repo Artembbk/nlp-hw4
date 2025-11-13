@@ -33,16 +33,20 @@ class TrainerWithStats:
     def train(self, epochs):
         stats = {'step': [], 'loss': [], 
                  'forward_time': [], 'backward_time': [], 'mem_MB': []}
+        
+        self.model.config.use_cache = False
         step = 0
         for epoch in range(epochs):
             for batch in self.dataloader:
                 # Подготовка
                 inputs = self.tokenizer(batch['text'], return_tensors='pt',
                                         padding=True, truncation=True).to(self.device)
+                labels = inputs.input_ids.clone()
+                labels[labels == self.tokenizer.pad_token_id] = -100
                 # Forward
                 torch.cuda.reset_peak_memory_stats(self.device)
                 t0 = time.perf_counter()
-                outputs = self.model(**inputs, labels=inputs['input_ids'])
+                outputs = self.model(**inputs, labels=labels, use_cache = False )
                 loss = outputs.loss
                 t1 = time.perf_counter()
                 # Backward
