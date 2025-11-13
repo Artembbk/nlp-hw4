@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast, get_linear_schedule_with_warmup
 from datasets import load_dataset
 from lora import LoRAInjector
+import tqdm
 
 class TrainerWithStats:
     def __init__(self, model, tokenizer, train_dataset, cfg):
@@ -37,7 +38,7 @@ class TrainerWithStats:
         self.model.config.use_cache = False
         step = 0
         for epoch in range(epochs):
-            for batch in self.dataloader:
+            for batch in tqdm.tqdm(self.dataloader):
                 # Подготовка
                 inputs = self.tokenizer(batch['text'], return_tensors='pt',
                                         padding=True, truncation=True).to(self.device)
