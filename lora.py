@@ -72,29 +72,53 @@ class LoRAInjector:
         _walk(self.model)
 
     # ----------------- профилирование -----------------
-    @torch.no_grad()
     def _fw(self, **batch):
         return self.model(**batch)
 
-    def profile(self, batch, warmup=10, reps=50, device="cuda"):
+    def profile(
+        self,
+        batch: dict,
+        warmup: int = 10,
+        reps:   int = 50,
+        device: str = "cuda"
+    ) -> dict:
+        """
+        batch  – dict с input_ids / attention_mask …
+        Возвращает: {'fw_ms':…, 'bw_ms':…, 'peak_mem_MB':…}
+        """
+        # ─── подготовка ────────────────────────────────────────────────
         batch = {k: v.to(device) for k, v in batch.items()}
+        self.model.to(device)
         torch.cuda.reset_peak_memory_stats(device)
-        self.model.to(device).eval()
 
-        # ── измеряем FW ────────────────────────────────
-        for _ in range(warmup): self._fw(**batch)
-        torch.cuda.synchronize();  t0 = time.time()
-        for _ in range(reps): self._fw(**batch)
-        torch.cuda.synchronize();  fw_t = (time.time()-t0)/reps
+        # ────────────────────────── Forward only ───────────────────────
+        self.model.eval()                        # отключаем Dropout
+        with torch.inference_mode():             # без градиентов
+            for _ in range(warmup):              # прогрев
+                self._fw(**batch)
+            torch.cuda.synchronize()
+            t0 = time.time()
+            for _ in range(reps):
+                self._fw(**batch)
+            torch.cuda.synchronize()
+            fw_time = (time.time() - t0) / reps  # среднее за 1 прогон
 
-        # ── измеряем BW ────────────────────────────────
-        self.model.train();  loss = None
+        # ────────────────────────── Backward (c grad) ──────────────────
+        self.model.train()
         for _ in range(warmup):
-            out = self._fw(**batch);  loss = out.logits.mean();  loss.backward();  self.model.zero_grad()
-        torch.cuda.synchronize();  t0 = time.time()
+            loss = self._fw(**batch).logits.mean()
+            loss.backward();  self.model.zero_grad()
+        torch.cuda.synchronize()
+        t0 = time.time()
         for _ in range(reps):
-            out = self._fw(**batch);  loss = out.logits.mean();  loss.backward();  self.model.zero_grad()
-        torch.cuda.synchronize();  bw_t = (time.time()-t0)/reps
+            loss = self._fw(**batch).logits.mean()
+            loss.backward();  self.model.zero_grad()
+        torch.cuda.synchronize()
+        bw_time = (time.time() - t0) / reps      # среднее
 
-        mem = torch.cuda.max_memory_allocated(device)/1024**2
-        return dict(fw_ms=fw_t*1e3, bw_ms=bw_t*1e3, peak_mem_MB=mem)
+        # ─── пиковая память ────────────────────────────────────────────
+        peak_mem = torch.cuda.max_memory_allocated(device) / 1024**2  # MB
+
+        return {"fw_ms": fw_time * 1e3,
+                "bw_ms": bw_time * 1e3,
+                "peak_mem_MB": peak_mem}
