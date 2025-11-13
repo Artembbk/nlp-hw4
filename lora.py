@@ -53,72 +53,56 @@ class LoRALinear(nn.Module):
 
 class LoRAInjector:
     def __init__(self, model: nn.Module, r=4, alpha=8, dropout=0.):
+        """
+        model   – ваша исходная модель
+        cfg     – конфигурация LoRA
+        added   – список кортежей (path, old_module, new_module)
+        """
         self.model, self.cfg = model, dict(r=r, alpha=alpha, dropout=dropout)
         self.added = []                      # (module_path, old_module, new_module)
 
+        # сразу заморозим все параметры
+        for p in self.model.parameters():
+            p.requires_grad = False
+
     # ----------------- вставка LoRA -----------------
     def _replace(self, parent, name, old):
+        """
+        Заменяем линейный слой old → LoRALinear, 
+        сохраняем в added для дальнейшей настройки requires_grad
+        """
         new = LoRALinear(old, **self.cfg)
         setattr(parent, name, new)
         self.added.append((f"{parent}.{name}", old, new))
 
+        # у новых LoRA-параметров включаем градиент
+        for p in new.lora_A.parameters():
+            p.requires_grad = True
+        for p in new.lora_B.parameters():
+            p.requires_grad = True
+        # если у LoRALinear есть bias или alpha, их тоже разморозим:
+        if hasattr(new, "bias") and new.bias is not None:
+            new.bias.requires_grad = True
+        if hasattr(new, "lora_alpha"):
+            new.lora_alpha.requires_grad = True
+
     def add_lora(self, target_names=("q_proj", "v_proj")):
+        """
+        Рекурсивно ищем nn.Linear по именам target_names,
+        заменяем их на LoRALinear, при этом:
+          - все исходные параметры изначально заморожены
+          - активируем градиент только для новых лор-слоёв
+        """
         def _walk(mod: nn.Module):
             for n, child in list(mod.named_children()):
                 if isinstance(child, nn.Linear) and n in target_names:
                     self._replace(mod, n, child)
                 else:
                     _walk(child)
+
         _walk(self.model)
 
-    # ----------------- профилирование -----------------
-    def _fw(self, **batch):
-        return self.model(**batch)
-
-    def profile(
-        self,
-        batch: dict,
-        warmup: int = 10,
-        reps:   int = 50,
-        device: str = "cuda"
-    ) -> dict:
-        """
-        batch  – dict с input_ids / attention_mask …
-        Возвращает: {'fw_ms':…, 'bw_ms':…, 'peak_mem_MB':…}
-        """
-        # ─── подготовка ────────────────────────────────────────────────
-        batch = {k: v.to(device) for k, v in batch.items()}
-        self.model.to(device)
-        torch.cuda.reset_peak_memory_stats(device)
-
-        # ────────────────────────── Forward only ───────────────────────
-        self.model.eval()                        # отключаем Dropout
-        with torch.inference_mode():             # без градиентов
-            for _ in range(warmup):              # прогрев
-                self._fw(**batch)
-            torch.cuda.synchronize()
-            t0 = time.time()
-            for _ in range(reps):
-                self._fw(**batch)
-            torch.cuda.synchronize()
-            fw_time = (time.time() - t0) / reps  # среднее за 1 прогон
-
-        # ────────────────────────── Backward (c grad) ──────────────────
-        self.model.train()
-        for _ in range(warmup):
-            loss = self._fw(**batch).logits.mean()
-            loss.backward();  self.model.zero_grad()
-        torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(reps):
-            loss = self._fw(**batch).logits.mean()
-            loss.backward();  self.model.zero_grad()
-        torch.cuda.synchronize()
-        bw_time = (time.time() - t0) / reps      # среднее
-
-        # ─── пиковая память ────────────────────────────────────────────
-        peak_mem = torch.cuda.max_memory_allocated(device) / 1024**2  # MB
-
-        return {"fw_ms": fw_time * 1e3,
-                "bw_ms": bw_time * 1e3,
-                "peak_mem_MB": peak_mem}
+        # опционально: выводим информацию о вставленных слоях
+        print(f"Inserted LoRA into {len(self.added)} modules:")
+        for path, old, new in self.added:
+            print(f"  • {path}: {old} → {new}")
