@@ -76,15 +76,15 @@ class LoRAInjector:
         self.added.append((f"{parent}.{name}", old, new))
 
         # у новых LoRA-параметров включаем градиент
-        for p in new.lora_A.parameters():
+        for p in new.A.parameters():
             p.requires_grad = True
-        for p in new.lora_B.parameters():
+        for p in new.B.parameters():
             p.requires_grad = True
         # если у LoRALinear есть bias или alpha, их тоже разморозим:
         if hasattr(new, "bias") and new.bias is not None:
             new.bias.requires_grad = True
-        if hasattr(new, "lora_alpha"):
-            new.lora_alpha.requires_grad = True
+        if hasattr(new, "alpha"):
+            new.alpha.requires_grad = True
 
     def add_lora(self, target_names=("q_proj", "v_proj")):
         """
@@ -96,7 +96,6 @@ class LoRAInjector:
         def _walk(mod: nn.Module):
             for n, child in list(mod.named_children()):
                 if isinstance(child, nn.Linear) and n in target_names:
-                    print("insert")
                     self._replace(mod, n, child)
                 else:
                     _walk(child)
